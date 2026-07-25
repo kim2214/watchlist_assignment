@@ -1,0 +1,231 @@
+import 'package:flutter/material.dart';
+
+import '../domain/symbol_view.dart';
+import '../seed/market_feed.dart';
+import '../state/market_store.dart';
+
+/// 개선본(after) 목록 화면.
+///
+/// 갱신 경로:
+///  - 요약 / Top-20 / 에러배너 = 각각 별도 ValueNotifier 구독 (행과 격리)
+///  - 각 행 = 자기 종목 notifier만 구독 + RepaintBoundary
+///  - ListView.builder가 "보이는 행"만 만들고, notifier가 "바뀐 종목"만 알리므로
+///    결과적으로 (보이는 ∩ 바뀐) 행만 rebuild된다.
+class WatchlistScreen extends StatefulWidget {
+  const WatchlistScreen({super.key});
+
+  @override
+  State<WatchlistScreen> createState() => _WatchlistScreenState();
+}
+
+class _WatchlistScreenState extends State<WatchlistScreen> {
+  late final MarketStore _store;
+
+  @override
+  void initState() {
+    super.initState();
+    _store = MarketStore(MarketFeed())..start();
+  }
+
+  @override
+  void dispose() {
+    _store.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('관심종목'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+      ),
+      body: Column(
+        children: [
+          _ErrorBanner(store: _store),
+          _SummaryBar(store: _store),
+          _TopMoversStrip(store: _store),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView.builder(
+              itemCount: _store.symbolCount,
+              itemExtent: 60, // 고정 높이 → 레이아웃 계산 절감
+              itemBuilder: (context, index) {
+                final info = _store.infoAt(index);
+                return RepaintBoundary(
+                  child: ValueListenableBuilder<SymbolView>(
+                    valueListenable: _store.notifierFor(info.code),
+                    builder: (_, view, _) => _WatchRow(
+                      name: info.name,
+                      code: info.code,
+                      view: view,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 스트림 에러 배너. 에러 중에만 표시되고 다음 배치에서 자동 사라진다.
+class _ErrorBanner extends StatelessWidget {
+  const _ErrorBanner({required this.store});
+  final MarketStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<String?>(
+      valueListenable: store.error,
+      builder: (_, msg, _) {
+        if (msg == null) return const SizedBox.shrink();
+        return Container(
+          width: double.infinity,
+          color: Colors.orange.shade100,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            children: [
+              const Icon(Icons.sync_problem, size: 16, color: Colors.orange),
+              const SizedBox(width: 8),
+              Expanded(child: Text('일시적 피드 지연 — 복구 중  ($msg)')),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// 요약 영역 (표시 종목 수 + 시총 합계). summary notifier만 구독.
+class _SummaryBar extends StatelessWidget {
+  const _SummaryBar({required this.store});
+  final MarketStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<MarketSummary>(
+      valueListenable: store.summary,
+      builder: (_, s, _) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        color: Colors.grey.shade100,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('표시 중: ${s.count} 종목'),
+            const SizedBox(height: 4),
+            Text('시가총액 합계: ${_formatCap(s.totalMarketCap)}'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 등락률 상위 20 (가로 스크롤). topMovers notifier만 구독.
+class _TopMoversStrip extends StatelessWidget {
+  const _TopMoversStrip({required this.store});
+  final MarketStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 64,
+      child: ValueListenableBuilder<List<TopMover>>(
+        valueListenable: store.topMovers,
+        builder: (_, movers, _) => ListView.builder(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          itemCount: movers.length,
+          itemBuilder: (_, i) {
+            final m = movers[i];
+            return Container(
+              width: 96,
+              margin: const EdgeInsets.symmetric(horizontal: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('${i + 1}. ${m.name}',
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                  Text(
+                    '+${m.changePct.toStringAsFixed(2)}%',
+                    style: const TextStyle(
+                        color: Colors.red, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+/// 한 행. 자기 종목 notifier의 SymbolView만 받아 그린다.
+class _WatchRow extends StatelessWidget {
+  const _WatchRow({required this.name, required this.code, required this.view});
+
+  final String name;
+  final String code;
+  final SymbolView view;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = view.halted
+        ? Colors.grey
+        : view.changePct > 0
+            ? Colors.red
+            : view.changePct < 0
+                ? Colors.blue
+                : Colors.grey;
+
+    return ListTile(
+      dense: true,
+      title: Row(
+        children: [
+          Flexible(child: Text(name, overflow: TextOverflow.ellipsis)),
+          if (view.halted) ...[
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade300,
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: const Text('정지', style: TextStyle(fontSize: 10)),
+            ),
+          ],
+        ],
+      ),
+      subtitle: Text('$code  ·  거래량 ${view.dayVolume}'),
+      trailing: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Text('${view.price.toStringAsFixed(0)}원',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          Text(
+            '${view.changePct >= 0 ? '+' : ''}${view.changePct.toStringAsFixed(2)}%',
+            style: TextStyle(color: color, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _formatCap(double v) {
+  if (v >= 1e12) return '${(v / 1e12).toStringAsFixed(1)}조';
+  if (v >= 1e8) return '${(v / 1e8).toStringAsFixed(1)}억';
+  return v.toStringAsFixed(0);
+}
