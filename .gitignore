@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# 벤치마크 콘솔 로그(재현 가능, 데이터는 run_*.json에 보존)
+perf/runs/*.log

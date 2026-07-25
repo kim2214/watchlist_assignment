@@ -12,7 +12,14 @@ import '../state/market_store.dart';
 ///  - ListView.builder가 "보이는 행"만 만들고, notifier가 "바뀐 종목"만 알리므로
 ///    결과적으로 (보이는 ∩ 바뀐) 행만 rebuild된다.
 class WatchlistScreen extends StatefulWidget {
-  const WatchlistScreen({super.key});
+  const WatchlistScreen({super.key, this.feed, this.autoStart = true});
+
+  /// 벤치마크에서 pump()로 구동하기 위해 외부 feed를 주입할 수 있다.
+  /// null이면 화면이 직접 생성/소유한다(=앱 실행 경로).
+  final MarketFeed? feed;
+
+  /// false면 feed.start()를 호출하지 않는다(=pump 기반 벤치마크 경로).
+  final bool autoStart;
 
   @override
   State<WatchlistScreen> createState() => _WatchlistScreenState();
@@ -24,7 +31,8 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
   @override
   void initState() {
     super.initState();
-    _store = MarketStore(MarketFeed())..start();
+    _store = MarketStore(widget.feed ?? MarketFeed(), ownsFeed: widget.feed == null)
+      ..start(autoStart: widget.autoStart);
   }
 
   @override
@@ -53,12 +61,14 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
               itemBuilder: (context, index) {
                 final info = _store.infoAt(index);
                 return RepaintBoundary(
-                  child: ValueListenableBuilder<SymbolView>(
+                  // int 신호가 바뀔 때만 rebuild. 데이터는 그 시점에 viewOf()로
+                  // 라이브 상태에서 읽으므로 스크롤로 새로 보이는 행도 항상 최신.
+                  child: ValueListenableBuilder<int>(
                     valueListenable: _store.notifierFor(info.code),
-                    builder: (_, view, _) => _WatchRow(
+                    builder: (_, _, _) => _WatchRow(
                       name: info.name,
                       code: info.code,
-                      view: view,
+                      view: _store.viewOf(info.code),
                     ),
                   ),
                 );

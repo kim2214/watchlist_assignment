@@ -17,14 +17,22 @@ import '../seed/market_models.dart';
 /// 실행: `flutter run --profile -t lib/main_baseline.dart -d [device]`
 /// ============================================================================
 class NaiveWatchlistScreen extends StatefulWidget {
-  const NaiveWatchlistScreen({super.key});
+  const NaiveWatchlistScreen({super.key, this.feed, this.autoStart = true});
+
+  /// 벤치마크에서 pump()로 구동하기 위해 외부 feed를 주입할 수 있다.
+  /// null이면 화면이 직접 생성/소유한다(=앱 실행 경로).
+  final MarketFeed? feed;
+
+  /// false면 feed.start()를 호출하지 않는다(=pump 기반 벤치마크 경로).
+  final bool autoStart;
 
   @override
   State<NaiveWatchlistScreen> createState() => _NaiveWatchlistScreenState();
 }
 
 class _NaiveWatchlistScreenState extends State<NaiveWatchlistScreen> {
-  final MarketFeed _feed = MarketFeed();
+  late final MarketFeed _feed = widget.feed ?? MarketFeed();
+  bool get _ownsFeed => widget.feed == null;
   StreamSubscription<List<QuoteTick>>? _sub;
 
   late final List<SymbolInfo> _symbols;
@@ -58,13 +66,13 @@ class _NaiveWatchlistScreenState extends State<NaiveWatchlistScreen> {
       });
     });
 
-    _feed.start();
+    if (widget.autoStart) _feed.start();
   }
 
   @override
   void dispose() {
     _sub?.cancel();
-    _feed.dispose();
+    if (_ownsFeed) _feed.dispose(); // 주입된 feed는 소유자(벤치마크)가 정리
     super.dispose();
   }
 

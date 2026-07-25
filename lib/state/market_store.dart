@@ -20,9 +20,14 @@ import '../seed/market_models.dart';
 ///  6) 증분 집계 — 시총 합계는 델타로만 갱신 (전체 순회 X)
 ///  7) Top-20 라이브 랭킹 — SplayTreeSet로 dirty 종목만 재삽입 (전체 재정렬 X)
 class MarketStore {
-  MarketStore(this._feed);
+  MarketStore(this._feed, {this.ownsFeed = true});
 
   final MarketFeed _feed;
+
+  /// 이 스토어가 feed의 생명주기를 소유하는가.
+  /// 벤치마크처럼 외부에서 feed를 주입/정리하는 경우 false.
+  final bool ownsFeed;
+
   StreamSubscription<List<QuoteTick>>? _sub;
 
   // 정적 메타 + 기준값
@@ -37,8 +42,11 @@ class MarketStore {
   final Map<String, int> _lastTs = {}; // 종목별 마지막 반영 timestampMs
   final Map<String, bool> _halted = {};
 
-  // 행별 구독 대상 (종목당 1개)
-  final Map<String, ValueNotifier<SymbolView>> _notifiers = {};
+  // 행별 구독 대상 (종목당 1개).
+  // 값은 "다시 그려라" 신호용 리빌드 카운터일 뿐, 데이터를 나르지 않는다.
+  // 데이터는 행이 그릴 때 viewOf()로 라이브 상태에서 직접 읽는다 → 스크롤로
+  // 새로 보이게 된 행도 항상 최신값으로 그려진다(신선도 유지).
+  final Map<String, _RowSignal> _notifiers = {};
 
   // Coalescing 버퍼: 이번 프레임에 바뀐 종목
   final Set<String> _dirty = {};
@@ -59,48 +67,40 @@ class MarketStore {
       ValueNotifier(const <TopMover>[]);
   final ValueNotifier<String?> error = ValueNotifier<String?>(null);
 
-  ValueNotifier<SymbolView> notifierFor(String code) => _notifiers[code]!;
+  /// 행이 구독할 리빌드 신호. 값 자체는 의미 없다(바뀌면 rebuild).
+  ValueListenable<int> notifierFor(String code) => _notifiers[code]!;
+
+  /// 행이 그릴 때 호출. 라이브 상태에서 현재 뷰를 조립한다.
+  SymbolView viewOf(String code) => SymbolView(
+        price: _price[code]!,
+        changePct: _pctOf(code),
+        dayVolume: _volume[code]!,
+        halted: _halted[code]!,
+      );
+
   SymbolInfo infoAt(int index) => symbols[index];
   int get symbolCount => symbols.length;
 
-  /// 스냅샷으로 초기 상태를 세우고, feed 구독을 시작한다.
-  void start() {
-    symbols = _feed.symbols;
-    for (final e in _feed.initialSnapshot()) {
-      final c = e.info.code;
-      _infoByCode[c] = e.info;
-      _prevClose[c] = e.previousClose;
-      _shares[c] = e.info.listedShares;
-      _price[c] = e.price;
-      _volume[c] = e.dayVolume;
-      _lastTs[c] = -1;
-      _halted[c] = false;
-
-      final pct = _pctOf(c);
-      _treePct[c] = pct;
-      _notifiers[c] = ValueNotifier(
-        SymbolView(price: e.price, changePct: pct, dayVolume: e.dayVolume, halted: false),
-      );
-      _totalMarketCap += e.price * e.info.listedShares;
-    }
-    _ranked.addAll(symbols.map((s) => s.code));
-    summary.value =
-        MarketSummary(count: symbols.length, totalMarketCap: _totalMarketCap);
-    topMovers.value = _computeTop20();
-
+  /// 스냅샷으로 초기 상태를 세우고 feed를 구독한다.
+  ///
+  /// [autoStart] 가 true면 feed.start()로 실시간 방출을 켠다(=앱 실행 경로).
+  /// false면 구독만 걸고 방출은 외부의 pump()로 구동한다(=벤치마크 경로).
+  void start({bool autoStart = true}) {
+    _initFromSnapshot();
     _sub = _feed.ticks.listen(
       _onBatch,
       onError: _onError,
       cancelOnError: false, // 에러가 나도 구독을 유지한다
     );
-    _feed.start();
+    if (autoStart) _feed.start();
   }
 
   /// 벤치마크(pump) 경로: feed.start() 없이 구독만 건다.
-  void attachForBenchmark() {
+  @visibleForTesting
+  void attachForBenchmark() => start(autoStart: false);
+
+  void _initFromSnapshot() {
     symbols = _feed.symbols;
-    // start()의 초기화 로직을 재사용하되 feed.start()는 부르지 않는다.
-    // (여기서는 간결히 start()와 동일 초기화만 수행)
     for (final e in _feed.initialSnapshot()) {
       final c = e.info.code;
       _infoByCode[c] = e.info;
@@ -110,18 +110,16 @@ class MarketStore {
       _volume[c] = e.dayVolume;
       _lastTs[c] = -1;
       _halted[c] = false;
+
       final pct = _pctOf(c);
       _treePct[c] = pct;
-      _notifiers[c] = ValueNotifier(
-        SymbolView(price: e.price, changePct: pct, dayVolume: e.dayVolume, halted: false),
-      );
+      _notifiers[c] = _RowSignal();
       _totalMarketCap += e.price * e.info.listedShares;
     }
     _ranked.addAll(symbols.map((s) => s.code));
     summary.value =
         MarketSummary(count: symbols.length, totalMarketCap: _totalMarketCap);
     topMovers.value = _computeTop20();
-    _sub = _feed.ticks.listen(_onBatch, onError: _onError, cancelOnError: false);
   }
 
   void _onError(Object e, StackTrace _) {
@@ -177,13 +175,15 @@ class MarketStore {
     for (final c in _dirty) {
       final pct = _pctOf(c);
 
-      // (5) 바뀐 종목의 notifier만 갱신 → 보이는 그 행만 rebuild.
-      _notifiers[c]!.value = SymbolView(
-        price: _price[c]!,
-        changePct: pct,
-        dayVolume: _volume[c]!,
-        halted: _halted[c]!,
-      );
+      // (5) 바뀐 종목의 행만 rebuild 신호를 준다.
+      //  + 꼬리 최적화: 화면에 보이는(리스너가 붙은) 행만 신호한다. 안 보이는 행은
+      //    어차피 아무도 구독하지 않으므로 rebuild도, 뷰 객체 생성도 없다. 뷰(SymbolView)
+      //    는 이제 flush가 아니라 행이 그릴 때 viewOf()로 만들어지므로, 큰 배치(최대
+      //    250건) 프레임에서 안 보이는 ~240개 종목의 객체 할당이 통째로 사라진다.
+      //    → worst/99th 프레임과 GC를 낮추는 게 목표. 스크롤로 나중에 보이게 된 행은
+      //    그 시점에 viewOf()가 라이브 상태를 읽어 최신값으로 그린다(신선도 유지).
+      final notifier = _notifiers[c]!;
+      if (notifier.isWatched) notifier.bump();
 
       // (7) Top-20: pct가 바뀐 종목만 트리에서 빼고 다시 넣는다(전체 재정렬 X).
       if (_treePct[c] != pct) {
@@ -236,11 +236,11 @@ class MarketStore {
 
   /// 테스트용: 현재 종목 뷰 조회.
   @visibleForTesting
-  SymbolView debugViewOf(String code) => _notifiers[code]!.value;
+  SymbolView debugViewOf(String code) => viewOf(code);
 
   void dispose() {
     _sub?.cancel();
-    _feed.dispose();
+    if (ownsFeed) _feed.dispose(); // 주입된 feed는 소유자가 정리
     for (final n in _notifiers.values) {
       n.dispose();
     }
@@ -248,4 +248,16 @@ class MarketStore {
     topMovers.dispose();
     error.dispose();
   }
+}
+
+/// 행의 rebuild 신호. 값(int)은 카운터일 뿐 데이터가 아니다.
+/// [hasListeners]가 protected라 여기서 [isWatched]로 노출해, Store가 "화면에
+/// 보이는(구독 중인) 행"만 골라 신호할 수 있게 한다(꼬리 최적화의 핵심).
+class _RowSignal extends ValueNotifier<int> {
+  _RowSignal() : super(0);
+
+  /// 이 행이 현재 화면에 렌더 중(구독자 있음)인가.
+  bool get isWatched => hasListeners;
+
+  void bump() => value++;
 }
