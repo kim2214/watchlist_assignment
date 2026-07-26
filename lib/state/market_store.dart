@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 
 import '../domain/symbol_view.dart';
+import '../search/chosung.dart';
 import '../seed/market_feed.dart';
 import '../seed/market_models.dart';
 
@@ -36,6 +37,9 @@ class MarketStore {
   final Map<String, double> _prevClose = {};
   final Map<String, int> _shares = {};
 
+  // 초성 인덱스(이름 불변 → 1회 계산). code → "ㄱㅇㅈㅈ" 형태.
+  final Map<String, String> _chosungByCode = {};
+
   // 실시간 상태 (정합성 처리 후)
   final Map<String, double> _price = {};
   final Map<String, int> _volume = {};
@@ -66,6 +70,26 @@ class MarketStore {
   final ValueNotifier<List<TopMover>> topMovers =
       ValueNotifier(const <TopMover>[]);
   final ValueNotifier<String?> error = ValueNotifier<String?>(null);
+
+  // 검색/필터 상태.
+  // _filtered == null  → 필터 없음(전체 2,000, 빠른 경로).
+  // _filtered != null  → 통과한 종목 코드 목록(검색 결과 순서 = 원래 순서).
+  List<String>? _filtered;
+  String _query = '';
+
+  /// 필터 "구조"가 바뀔 때(=목록 길이/구성 변경) 화면이 다시 빌드하도록 하는 신호.
+  final ValueNotifier<int> filterVersion = ValueNotifier<int>(0);
+
+  String get query => _query;
+
+  /// 표시 중 종목 수 = 필터 통과 수(필터 없으면 전체).
+  int get visibleCount => _filtered?.length ?? symbols.length;
+
+  /// 화면 index → 종목 코드 (필터 유무에 따라 소스가 다름).
+  String codeAt(int index) => _filtered?[index] ?? symbols[index].code;
+
+  /// 화면 index → 종목명.
+  String nameAt(int index) => _infoByCode[codeAt(index)]!.name;
 
   /// 행이 구독할 리빌드 신호. 값 자체는 의미 없다(바뀌면 rebuild).
   ValueListenable<int> notifierFor(String code) => _notifiers[code]!;
@@ -111,15 +135,47 @@ class MarketStore {
       _lastTs[c] = -1;
       _halted[c] = false;
 
+      _chosungByCode[c] = chosungOf(e.info.name); // 이름 불변 → 1회만
+
       final pct = _pctOf(c);
       _treePct[c] = pct;
       _notifiers[c] = _RowSignal();
       _totalMarketCap += e.price * e.info.listedShares;
     }
     _ranked.addAll(symbols.map((s) => s.code));
-    summary.value =
-        MarketSummary(count: symbols.length, totalMarketCap: _totalMarketCap);
-    topMovers.value = _computeTop20();
+    _recomputeAggregates();
+  }
+
+  /// 검색어 적용. 필터 집합을 새로 만들고 집계를 갱신한다.
+  /// (debounce는 UI가 담당 — 여기선 한 번의 O(n) 스캔만 수행.)
+  void setQuery(String raw) {
+    final q = raw.trim();
+    if (q == _query) return;
+    _query = q;
+
+    if (q.isEmpty) {
+      _filtered = null;
+    } else {
+      final digit = hasDigit(q);
+      final chosung = !digit && isChosungQuery(q);
+      final result = <String>[];
+      for (final s in symbols) {
+        final code = s.code;
+        final bool hit;
+        if (digit) {
+          hit = code.contains(q); // 종목코드 부분일치
+        } else if (chosung) {
+          hit = _chosungByCode[code]!.startsWith(q); // 초성 앞일치
+        } else {
+          hit = s.name.contains(q); // 완성형 이름 부분일치
+        }
+        if (hit) result.add(code);
+      }
+      _filtered = result;
+    }
+
+    filterVersion.value++; // 목록 구조 변경 → 화면 재빌드
+    _recomputeAggregates(); // 틱이 없어도 시총·Top-20 즉시 갱신
   }
 
   void _onError(Object e, StackTrace _) {
@@ -194,10 +250,30 @@ class MarketStore {
       }
     }
     _dirty.clear();
+    _recomputeAggregates(topDirty: topDirty);
+  }
 
-    summary.value =
-        MarketSummary(count: symbols.length, totalMarketCap: _totalMarketCap);
-    if (topDirty) topMovers.value = _computeTop20();
+  /// 요약(시총·표시수)과 Top-20을 현재 필터 상태에 맞게 갱신한다.
+  ///
+  /// 판단(DESIGN.md에 명시): **필터가 걸리면 집계도 필터 집합 기준**이다
+  /// (사용자가 보는 집합과 일치). 필터가 없으면 전체 기준의 빠른 경로를 쓴다.
+  void _recomputeAggregates({bool topDirty = true}) {
+    final filtered = _filtered;
+    if (filtered == null) {
+      // 빠른 경로: 전체 시총은 증분값, Top-20은 pct 변동 시에만 트리에서 재계산.
+      summary.value =
+          MarketSummary(count: symbols.length, totalMarketCap: _totalMarketCap);
+      if (topDirty) topMovers.value = _computeTop20Full();
+    } else {
+      // 필터 경로: 통과 집합만 순회(크기에 비례, bounded). 시총 합계·Top-20 산출.
+      var cap = 0.0;
+      for (final c in filtered) {
+        cap += _price[c]! * _shares[c]!;
+      }
+      summary.value =
+          MarketSummary(count: filtered.length, totalMarketCap: cap);
+      topMovers.value = _computeTop20Filtered(filtered);
+    }
   }
 
   double _pctOf(String code) {
@@ -214,7 +290,8 @@ class MarketStore {
     return c != 0 ? c : a.compareTo(b); // 동률은 코드로 안정 정렬
   }
 
-  List<TopMover> _computeTop20() {
+  /// 전체 기준 Top-20: SplayTreeSet의 앞에서 20개(트리가 이미 정렬 유지).
+  List<TopMover> _computeTop20Full() {
     final out = <TopMover>[];
     for (final c in _ranked) {
       final info = _infoByCode[c]!;
@@ -226,6 +303,28 @@ class MarketStore {
         halted: _halted[c]!,
       ));
       if (out.length >= 20) break;
+    }
+    return out;
+  }
+
+  /// 필터 집합 기준 Top-20: 통과 집합을 등락률 내림차순 정렬해 상위 20(집합 크기에 비례).
+  List<TopMover> _computeTop20Filtered(List<String> codes) {
+    final sorted = [...codes]..sort((a, b) {
+        final c = _pctOf(b).compareTo(_pctOf(a));
+        return c != 0 ? c : a.compareTo(b);
+      });
+    final n = sorted.length < 20 ? sorted.length : 20;
+    final out = <TopMover>[];
+    for (var i = 0; i < n; i++) {
+      final code = sorted[i];
+      final info = _infoByCode[code]!;
+      out.add(TopMover(
+        code: code,
+        name: info.name,
+        changePct: _pctOf(code),
+        price: _price[code]!,
+        halted: _halted[code]!,
+      ));
     }
     return out;
   }
@@ -247,6 +346,7 @@ class MarketStore {
     summary.dispose();
     topMovers.dispose();
     error.dispose();
+    filterVersion.dispose();
   }
 }
 

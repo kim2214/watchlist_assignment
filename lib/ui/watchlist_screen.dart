@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../domain/symbol_view.dart';
@@ -27,6 +29,8 @@ class WatchlistScreen extends StatefulWidget {
 
 class _WatchlistScreenState extends State<WatchlistScreen> {
   late final MarketStore _store;
+  final TextEditingController _searchCtrl = TextEditingController();
+  Timer? _debounce;
 
   @override
   void initState() {
@@ -37,8 +41,16 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
 
   @override
   void dispose() {
+    _debounce?.cancel();
+    _searchCtrl.dispose();
     _store.dispose();
     super.dispose();
+  }
+
+  // keystroke마다 필터를 돌리지 않고, 입력이 멎으면 200ms 후 1회만 적용.
+  void _onQueryChanged(String q) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 200), () => _store.setQuery(q));
   }
 
   @override
@@ -50,32 +62,68 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
       ),
       body: Column(
         children: [
+          _SearchField(controller: _searchCtrl, onChanged: _onQueryChanged),
           _ErrorBanner(store: _store),
           _SummaryBar(store: _store),
           _TopMoversStrip(store: _store),
           const Divider(height: 1),
+          // 필터 "구조"(목록 길이/구성)가 바뀔 때만 리스트를 다시 빌드.
           Expanded(
-            child: ListView.builder(
-              itemCount: _store.symbolCount,
-              itemExtent: 60, // 고정 높이 → 레이아웃 계산 절감
-              itemBuilder: (context, index) {
-                final info = _store.infoAt(index);
-                return RepaintBoundary(
-                  // int 신호가 바뀔 때만 rebuild. 데이터는 그 시점에 viewOf()로
-                  // 라이브 상태에서 읽으므로 스크롤로 새로 보이는 행도 항상 최신.
-                  child: ValueListenableBuilder<int>(
-                    valueListenable: _store.notifierFor(info.code),
-                    builder: (_, _, _) => _WatchRow(
-                      name: info.name,
-                      code: info.code,
-                      view: _store.viewOf(info.code),
-                    ),
-                  ),
+            child: ValueListenableBuilder<int>(
+              valueListenable: _store.filterVersion,
+              builder: (_, _, _) {
+                final count = _store.visibleCount;
+                if (count == 0) {
+                  return const Center(child: Text('검색 결과가 없습니다'));
+                }
+                return ListView.builder(
+                  itemCount: count,
+                  itemExtent: 60, // 고정 높이 → 레이아웃 계산 절감
+                  itemBuilder: (context, index) {
+                    final code = _store.codeAt(index);
+                    return RepaintBoundary(
+                      // int 신호가 바뀔 때만 rebuild. 데이터는 그 시점에 viewOf()로
+                      // 라이브 상태에서 읽으므로 스크롤로 새로 보이는 행도 항상 최신.
+                      child: ValueListenableBuilder<int>(
+                        valueListenable: _store.notifierFor(code),
+                        builder: (_, _, _) => _WatchRow(
+                          name: _store.nameAt(index),
+                          code: code,
+                          view: _store.viewOf(code),
+                        ),
+                      ),
+                    );
+                  },
                 );
               },
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 검색 입력. 초성(ㄱㅇ)·완성형(전자)·종목코드(000590) 모두 지원.
+class _SearchField extends StatelessWidget {
+  const _SearchField({required this.controller, required this.onChanged});
+
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: TextField(
+        controller: controller,
+        onChanged: onChanged,
+        decoration: InputDecoration(
+          isDense: true,
+          hintText: '초성(ㄱㅇ) · 이름(전자) · 코드(000590)',
+          prefixIcon: const Icon(Icons.search, size: 20),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+        ),
       ),
     );
   }
