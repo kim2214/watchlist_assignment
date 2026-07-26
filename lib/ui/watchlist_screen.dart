@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../domain/symbol_view.dart';
 import '../seed/market_feed.dart';
 import '../state/market_store.dart';
+import 'detail_screen.dart';
 
 /// 개선본(after) 목록 화면.
 ///
@@ -90,6 +91,12 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
                           name: _store.nameAt(index),
                           code: code,
                           view: _store.viewOf(code),
+                          onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) =>
+                                  DetailScreen(store: _store, code: code),
+                            ),
+                          ),
                         ),
                       ),
                     );
@@ -231,11 +238,17 @@ class _TopMoversStrip extends StatelessWidget {
 
 /// 한 행. 자기 종목 notifier의 SymbolView만 받아 그린다.
 class _WatchRow extends StatelessWidget {
-  const _WatchRow({required this.name, required this.code, required this.view});
+  const _WatchRow({
+    required this.name,
+    required this.code,
+    required this.view,
+    required this.onTap,
+  });
 
   final String name;
   final String code;
   final SymbolView view;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -249,6 +262,7 @@ class _WatchRow extends StatelessWidget {
 
     return ListTile(
       dense: true,
+      onTap: onTap,
       title: Row(
         children: [
           Flexible(child: Text(name, overflow: TextOverflow.ellipsis)),

@@ -46,6 +46,17 @@ class MarketStore {
   final Map<String, int> _lastTs = {}; // 종목별 마지막 반영 timestampMs
   final Map<String, bool> _halted = {};
 
+  // 상세 화면용 파생값. tick 흐름에서 누적(전 종목 O(1) 추적, 비용 미미).
+  final Map<String, double> _open = {}; // 구독 시점가(=시가 성격)
+  final Map<String, double> _high = {};
+  final Map<String, double> _low = {};
+
+  // 상세 화면 수명 관리.
+  String? _focusedCode; // 현재 상세로 보고 있는 종목(없으면 null)
+  bool _listPaused = false; // 상세가 떠 있는 동안 목록 갱신을 멈춘다
+  final List<double> _spark = []; // 포커스 종목의 최근 체결가(링버퍼)
+  static const int _sparkCap = 60;
+
   // 행별 구독 대상 (종목당 1개).
   // 값은 "다시 그려라" 신호용 리빌드 카운터일 뿐, 데이터를 나르지 않는다.
   // 데이터는 행이 그릴 때 viewOf()로 라이브 상태에서 직접 읽는다 → 스크롤로
@@ -105,6 +116,50 @@ class MarketStore {
   SymbolInfo infoAt(int index) => symbols[index];
   int get symbolCount => symbols.length;
 
+  // ── 상세 화면 수명 관리 ────────────────────────────────────────────────
+  /// 상세 진입: 이 종목만 갱신하고 목록 갱신은 멈춘다. 스파크라인 기록 시작.
+  void openDetail(String code) {
+    _focusedCode = code;
+    _listPaused = true;
+    _spark
+      ..clear()
+      ..add(_price[code]!); // 현재가 1점으로 시작
+  }
+
+  /// 상세 종료: 목록 갱신 재개 + 그동안의 변화를 반영하도록 강제 새로고침.
+  void closeDetail() {
+    _focusedCode = null;
+    _listPaused = false;
+    _spark.clear();
+    // offstage였던 목록 위젯들은 마지막 빌드 상태로 멈춰 있으므로, 보이는 행과
+    // 집계를 한 번 깨워 현재 상태로 맞춘다.
+    for (final n in _notifiers.values) {
+      if (n.isWatched) n.bump();
+    }
+    _recomputeAggregates();
+  }
+
+  /// 상세 뷰 조립(라이브 상태 + 누적 파생값 + 스파크라인 스냅샷).
+  DetailView detailOf(String code) {
+    final info = _infoByCode[code]!;
+    final price = _price[code]!;
+    final prev = _prevClose[code]!;
+    return DetailView(
+      code: code,
+      name: info.name,
+      price: price,
+      previousClose: prev,
+      changeAbs: price - prev,
+      changePct: _pctOf(code),
+      open: _open[code]!,
+      high: _high[code]!,
+      low: _low[code]!,
+      dayVolume: _volume[code]!,
+      halted: _halted[code]!,
+      spark: List<double>.of(_spark), // 스냅샷 복사(그리는 쪽과 분리)
+    );
+  }
+
   /// 스냅샷으로 초기 상태를 세우고 feed를 구독한다.
   ///
   /// [autoStart] 가 true면 feed.start()로 실시간 방출을 켠다(=앱 실행 경로).
@@ -134,6 +189,9 @@ class MarketStore {
       _volume[c] = e.dayVolume;
       _lastTs[c] = -1;
       _halted[c] = false;
+      _open[c] = e.price; // 구독 시점가를 시가로 삼는다
+      _high[c] = e.price;
+      _low[c] = e.price;
 
       _chosungByCode[c] = chosungOf(e.info.name); // 이름 불변 → 1회만
 
@@ -198,9 +256,17 @@ class MarketStore {
           // (6) 증분 시총: 전체 순회 없이 델타만 더한다.
           _totalMarketCap += (t.price - old) * _shares[c]!;
           _price[c] = t.price;
+          if (t.price > _high[c]!) _high[c] = t.price; // 고가 누적
+          if (t.price < _low[c]!) _low[c] = t.price; // 저가 누적
         }
         _halted[c] = t.status == QuoteStatus.halted;
         _dirty.add(c);
+
+        // 상세로 보고 있는 종목이면 스파크라인 링버퍼에 체결가 추가.
+        if (c == _focusedCode) {
+          _spark.add(_price[c]!);
+          if (_spark.length > _sparkCap) _spark.removeAt(0);
+        }
       }
       // 역순 tick이면 위 블록을 건너뛰어 가격이 과거로 되돌아가지 않는다.
 
@@ -239,7 +305,11 @@ class MarketStore {
       //    → worst/99th 프레임과 GC를 낮추는 게 목표. 스크롤로 나중에 보이게 된 행은
       //    그 시점에 viewOf()가 라이브 상태를 읽어 최신값으로 그린다(신선도 유지).
       final notifier = _notifiers[c]!;
-      if (notifier.isWatched) notifier.bump();
+      // 상세가 떠 있으면(_listPaused) 포커스 종목만 신호 → 목록의 불필요한 rebuild 제거.
+      // 트리 갱신은 계속해 복귀 시 랭킹이 정확하도록 한다.
+      if (notifier.isWatched && (!_listPaused || c == _focusedCode)) {
+        notifier.bump();
+      }
 
       // (7) Top-20: pct가 바뀐 종목만 트리에서 빼고 다시 넣는다(전체 재정렬 X).
       if (_treePct[c] != pct) {
@@ -250,7 +320,8 @@ class MarketStore {
       }
     }
     _dirty.clear();
-    _recomputeAggregates(topDirty: topDirty);
+    // 상세가 떠 있는 동안은 목록의 요약·Top-20 위젯이 offstage이므로 갱신 생략.
+    if (!_listPaused) _recomputeAggregates(topDirty: topDirty);
   }
 
   /// 요약(시총·표시수)과 Top-20을 현재 필터 상태에 맞게 갱신한다.

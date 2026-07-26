@@ -32,6 +32,44 @@ class MarketSummary {
   final double totalMarketCap;
 }
 
+/// 종목 상세 화면용 뷰. tick 흐름에서 누적한 파생값 포함.
+class DetailView {
+  const DetailView({
+    required this.code,
+    required this.name,
+    required this.price,
+    required this.previousClose,
+    required this.changeAbs,
+    required this.changePct,
+    required this.open,
+    required this.high,
+    required this.low,
+    required this.dayVolume,
+    required this.halted,
+    required this.spark,
+  });
+
+  final String code;
+  final String name;
+  final double price;
+  final double previousClose;
+
+  /// 전일 대비 등락폭(원) / 등락률(%).
+  final double changeAbs;
+  final double changePct;
+
+  /// 세션 동안 tick 흐름에서 누적한 시가(구독 시점가)·고가·저가.
+  final double open;
+  final double high;
+  final double low;
+
+  final int dayVolume;
+  final bool halted;
+
+  /// 최근 N개 체결가(스파크라인용). 오래된 것부터.
+  final List<double> spark;
+}
+
 /// 등락률 상위 목록의 한 항목.
 class TopMover {
   const TopMover({
