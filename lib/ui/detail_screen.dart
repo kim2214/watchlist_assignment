@@ -66,7 +66,8 @@ class _DetailBody extends StatelessWidget {
             : down
                 ? Colors.blue
                 : Colors.grey;
-    final sign = d.changeAbs >= 0 ? '+' : '';
+    // 상승(+)만 '+' 부호, 하락은 _fmt의 '-', 보합은 무부호(색·부호 기준을 일치).
+    final sign = up ? '+' : '';
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -137,14 +138,16 @@ class _DetailBody extends StatelessWidget {
       );
 
   static String _fmt(double v) {
-    final s = v.toStringAsFixed(0);
-    // 천 단위 콤마
+    // 절댓값에만 천 단위 콤마를 넣고 부호는 따로 붙인다.
+    // (음수의 '-'를 자릿수 계산에 포함시키면 "-,123" 처럼 콤마가 잘못 붙는다.)
+    final neg = v < 0;
+    final s = v.abs().toStringAsFixed(0);
     final buf = StringBuffer();
     for (var i = 0; i < s.length; i++) {
       if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
       buf.write(s[i]);
     }
-    return buf.toString();
+    return neg ? '-$buf' : buf.toString();
   }
 }
 
@@ -184,8 +187,14 @@ class _SparklinePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_SparklinePainter old) =>
-      old.prices.length != prices.length ||
-      (prices.isNotEmpty && old.prices.last != prices.last) ||
-      old.color != color;
+  bool shouldRepaint(_SparklinePainter old) {
+    // 상세는 프레임당 1회(coalesced) 재빌드되며 종목은 하나뿐이라 매번 다시 그려도
+    // 저렴하다. length/last만 비교하던 이전 방식은 링버퍼가 꽉 찬 뒤 평탄한 tick으로
+    // 창이 왼쪽으로 밀릴 때(길이·마지막값 동일) 변화를 놓쳐 stale 프레임을 남겼다.
+    if (old.color != color || old.prices.length != prices.length) return true;
+    for (var i = 0; i < prices.length; i++) {
+      if (old.prices[i] != prices[i]) return true;
+    }
+    return false;
+  }
 }

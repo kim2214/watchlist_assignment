@@ -207,12 +207,23 @@ class _TopMoversStrip extends StatelessWidget {
           itemCount: movers.length,
           itemBuilder: (_, i) {
             final m = movers[i];
+            // 등락률 내림차순 상위지만, 하락장/필터 집합에선 음수도 올 수 있다.
+            // 부호·색을 changePct 기준으로 정확히 표시.
+            final up = m.changePct > 0;
+            final down = m.changePct < 0;
+            final color = m.halted
+                ? Colors.grey
+                : up
+                    ? Colors.red
+                    : down
+                        ? Colors.blue
+                        : Colors.grey;
             return Container(
               width: 96,
               margin: const EdgeInsets.symmetric(horizontal: 4),
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: Colors.red.shade50,
+                color: color.withValues(alpha: 0.08),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Column(
@@ -222,9 +233,8 @@ class _TopMoversStrip extends StatelessWidget {
                   Text('${i + 1}. ${m.name}',
                       maxLines: 1, overflow: TextOverflow.ellipsis),
                   Text(
-                    '+${m.changePct.toStringAsFixed(2)}%',
-                    style: const TextStyle(
-                        color: Colors.red, fontWeight: FontWeight.bold),
+                    '${m.changePct >= 0 ? '+' : ''}${m.changePct.toStringAsFixed(2)}%',
+                    style: TextStyle(color: color, fontWeight: FontWeight.bold),
                   ),
                 ],
               ),
