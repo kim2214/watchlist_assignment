@@ -241,6 +241,11 @@ class MarketStore {
     error.value = e is MarketFeedException ? e.message : e.toString();
   }
 
+  /// **동기 유지 필수.** Dart 코드는 UI 아이솔레이트 하나에서 돌기 때문에, 이 함수가
+  /// 동기인 동안에는 루프 중간에 프레임이 끼어들 수 없다 → 가격만 갱신되고 시총 합계는
+  /// 아직인 "찢어진 상태"가 UI에 노출될 경로가 없다(그래서 락이 없어도 안전하다).
+  /// async/await를 넣으면 ① 배치 절반만 반영된 상태로 flush가 돌고
+  /// ② _dirty가 두 프레임에 쪼개져 coalescing 불변식이 깨진다.
   void _onBatch(List<QuoteTick> batch) {
     if (error.value != null) error.value = null; // 다음 배치 도착 = 복구
 

@@ -46,3 +46,9 @@ app.*.map.json
 
 # 벤치마크 콘솔 로그(재현 가능, 데이터는 run_*.json에 보존)
 perf/runs/*.log
+
+# 개인 학습/정리 노트 (제출 대상 아님. 설계 근거는 DESIGN.md, 수치는 PERF.md)
+CHEATSHEET.md
+INTERVIEW.md
+SUMMARY.md
+feed.md
