@@ -15,10 +15,10 @@ class SymbolView {
     required this.halted,
   });
 
-  final double price;
-  final double changePct;
-  final int dayVolume;
-  final bool halted;
+  final double price; // 현재 체결가
+  final double changePct; // 전일 종가 대비 등락률(%)
+  final int dayVolume; // 당일 누적 거래량
+  final bool halted; // 거래정지 여부(행 표시/색상 분기용)
 }
 
 /// 상단 요약 영역 값.
@@ -49,25 +49,25 @@ class DetailView {
     required this.spark,
   });
 
-  final String code;
-  final String name;
-  final double price;
-  final double previousClose;
+  final String code; // 종목 코드
+  final String name; // 종목명
+  final double price; // 현재 체결가
+  final double previousClose; // 전일 종가(등락 계산 기준선)
 
   /// 전일 대비 등락폭(원) / 등락률(%).
-  final double changeAbs;
-  final double changePct;
+  final double changeAbs; // = price - previousClose
+  final double changePct; // = (price - previousClose) / previousClose * 100
 
   /// 세션 동안 tick 흐름에서 누적한 시가(구독 시점가)·고가·저가.
   final double open;
   final double high;
   final double low;
 
-  final int dayVolume;
-  final bool halted;
+  final int dayVolume; // 당일 누적 거래량
+  final bool halted; // 거래정지 여부
 
   /// 최근 N개 체결가(스파크라인용). 오래된 것부터.
-  final List<double> spark;
+  final List<double> spark; // 그리는 쪽과 분리된 스냅샷 복사본
 }
 
 /// 등락률 상위 목록의 한 항목.
@@ -80,9 +80,9 @@ class TopMover {
     required this.halted,
   });
 
-  final String code;
-  final String name;
-  final double changePct;
-  final double price;
-  final bool halted;
+  final String code; // 종목 코드
+  final String name; // 종목명
+  final double changePct; // 등락률(%) — 이 목록의 정렬 기준
+  final double price; // 현재 체결가
+  final bool halted; // 거래정지 여부
 }

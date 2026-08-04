@@ -12,8 +12,25 @@ library;
 
 /// 초성 인덱스(0~18) → 키보드 입력과 같은 호환 자모 문자. (쌍자음 포함 19개)
 const List<String> _chosung = [
-  'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ',
-  'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+  'ㄱ',
+  'ㄲ',
+  'ㄴ',
+  'ㄷ',
+  'ㄸ',
+  'ㄹ',
+  'ㅁ',
+  'ㅂ',
+  'ㅃ',
+  'ㅅ',
+  'ㅆ',
+  'ㅇ',
+  'ㅈ',
+  'ㅉ',
+  'ㅊ',
+  'ㅋ',
+  'ㅌ',
+  'ㅍ',
+  'ㅎ',
 ];
 
 const int _hangulBase = 0xAC00; // '가'
@@ -25,8 +42,9 @@ const int _jamoPerChosung = 588; // 중성21 × 종성28
 String chosungOf(String s) {
   final sb = StringBuffer();
   for (var i = 0; i < s.length; i++) {
-    final c = s.codeUnitAt(i);
+    final c = s.codeUnitAt(i); // 문자 하나의 코드포인트
     if (c >= _hangulBase && c <= _hangulLast) {
+      // 완성형('가'~'힣')이면 초성 인덱스 = (코드 - 가) ~/ 588 → 호환 자모로 변환
       sb.write(_chosung[(c - _hangulBase) ~/ _jamoPerChosung]);
     } else {
       sb.writeCharCode(c); // 공백·영문·기호 등은 원문 유지
@@ -41,18 +59,19 @@ bool _isCompatConsonant(int c) => c >= 0x3131 && c <= 0x314E;
 
 /// 쿼리가 전부 초성(호환 자모 자음)인가.
 bool isChosungQuery(String q) {
-  if (q.isEmpty) return false;
+  if (q.isEmpty) return false; // 빈 쿼리는 초성 검색 아님
   for (var i = 0; i < q.length; i++) {
+    // 하나라도 자음(호환 자모)이 아니면 초성 검색이 아니다(완성형 이름 검색으로)
     if (!_isCompatConsonant(q.codeUnitAt(i))) return false;
   }
-  return true;
+  return true; // 전부 초성 자음 → 초성 앞일치 검색 대상
 }
 
 /// 쿼리에 숫자가 하나라도 있는가(=종목코드 검색 의도).
 bool hasDigit(String q) {
   for (var i = 0; i < q.length; i++) {
     final c = q.codeUnitAt(i);
-    if (c >= 0x30 && c <= 0x39) return true;
+    if (c >= 0x30 && c <= 0x39) return true; // '0'~'9' 하나라도 있으면 종목코드 검색
   }
   return false;
 }

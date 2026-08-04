@@ -23,6 +23,7 @@ import '../seed/market_models.dart';
 class MarketStore {
   MarketStore(this._feed, {this.ownsFeed = true});
 
+  // 데이터 흐름 feed
   final MarketFeed _feed;
 
   /// 이 스토어가 feed의 생명주기를 소유하는가.
@@ -32,24 +33,24 @@ class MarketStore {
   StreamSubscription<List<QuoteTick>>? _sub;
 
   // 정적 메타 + 기준값
-  late final List<SymbolInfo> symbols;
-  final Map<String, SymbolInfo> _infoByCode = {};
-  final Map<String, double> _prevClose = {};
-  final Map<String, int> _shares = {};
+  late final List<SymbolInfo> symbols; // 종목 정보
+  final Map<String, SymbolInfo> _infoByCode = {}; // 종목 코드에 대응하는 종목정보 (단일값)
+  final Map<String, double> _prevClose = {}; // 종목별 전일 종가(previous close)
+  final Map<String, int> _shares = {}; // 종목별 상장 주식 수
 
   // 초성 인덱스(이름 불변 → 1회 계산). code → "ㄱㅇㅈㅈ" 형태.
   final Map<String, String> _chosungByCode = {};
 
   // 실시간 상태 (정합성 처리 후)
-  final Map<String, double> _price = {};
-  final Map<String, int> _volume = {};
-  final Map<String, int> _lastTs = {}; // 종목별 마지막 반영 timestampMs
-  final Map<String, bool> _halted = {};
+  final Map<String, double> _price = {}; // 현재 체결가(역순 tick은 반영 안 함)
+  final Map<String, int> _volume = {}; // 누적 거래량(max로만 갱신 → 단조 증가)
+  final Map<String, int> _lastTs = {}; // 종목별 마지막 반영 timestampMs (역순 tick 가드 기준)
+  final Map<String, bool> _halted = {}; // 거래정지 여부(status == halted)
 
   // 상세 화면용 파생값. tick 흐름에서 누적(전 종목 O(1) 추적, 비용 미미).
   final Map<String, double> _open = {}; // 구독 시점가(=시가 성격)
-  final Map<String, double> _high = {};
-  final Map<String, double> _low = {};
+  final Map<String, double> _high = {}; // 구독 이후 최고가(tick마다 max로 누적)
+  final Map<String, double> _low = {}; // 구독 이후 최저가(tick마다 min으로 누적)
 
   // 상세 화면 수명 관리.
   String? _focusedCode; // 현재 상세로 보고 있는 종목(없으면 null)
@@ -63,8 +64,15 @@ class MarketStore {
   // 새로 보이게 된 행도 항상 최신값으로 그려진다(신선도 유지).
   final Map<String, _RowSignal> _notifiers = {};
 
-  // Coalescing 버퍼: 이번 프레임에 바뀐 종목
+  // Coalescing "무엇을": 이번 프레임에 값이 바뀐 종목 코드 모음.
+  // tick마다 UI를 갱신하지 않고 여기에 add만 해두었다가, flush에서 한꺼번에
+  // 처리한다. Set이라 한 프레임에 같은 종목이 여러 번 바뀌어도 1번만 처리(중복 제거).
   final Set<String> _dirty = {};
+
+  // Coalescing "언제": 이번 프레임에 flush를 이미 예약했는가(중복 예약 방지 잠금).
+  // _scheduleFlush가 배치마다 불려도 첫 호출만 콜백을 걸고 true로 잠근다.
+  // _flush 진입 시 false로 풀려 다음 프레임에 다시 예약할 수 있다.
+  // → _dirty(무엇을)와 짝을 이뤄 "프레임당 flush 정확히 1회"를 보장.
   bool _flushScheduled = false;
 
   // 증분 시총 합계
@@ -73,13 +81,17 @@ class MarketStore {
   // Top-20 라이브 랭킹: 등락률 내림차순으로 전 종목 정렬 유지.
   // 트리에 반영된 pct는 _treePct에 따로 보관해 트리 불변식을 지킨다.
   final Map<String, double> _treePct = {};
-  late final SplayTreeSet<String> _ranked = SplayTreeSet<String>(_compareByPctDesc);
+  late final SplayTreeSet<String> _ranked = SplayTreeSet<String>(
+    _compareByPctDesc,
+  );
 
   // 프레젠테이션이 구독하는 집계 notifier들 (행 rebuild와 격리)
-  final ValueNotifier<MarketSummary> summary =
-      ValueNotifier(const MarketSummary(count: 0, totalMarketCap: 0));
-  final ValueNotifier<List<TopMover>> topMovers =
-      ValueNotifier(const <TopMover>[]);
+  final ValueNotifier<MarketSummary> summary = ValueNotifier(
+    const MarketSummary(count: 0, totalMarketCap: 0),
+  );
+  final ValueNotifier<List<TopMover>> topMovers = ValueNotifier(
+    const <TopMover>[],
+  );
   final ValueNotifier<String?> error = ValueNotifier<String?>(null);
 
   // 검색/필터 상태.
@@ -107,13 +119,14 @@ class MarketStore {
 
   /// 행이 그릴 때 호출. 라이브 상태에서 현재 뷰를 조립한다.
   SymbolView viewOf(String code) => SymbolView(
-        price: _price[code]!,
-        changePct: _pctOf(code),
-        dayVolume: _volume[code]!,
-        halted: _halted[code]!,
-      );
+    price: _price[code]!,
+    changePct: _pctOf(code),
+    dayVolume: _volume[code]!,
+    halted: _halted[code]!,
+  );
 
   SymbolInfo infoAt(int index) => symbols[index];
+
   int get symbolCount => symbols.length;
 
   // ── 상세 화면 수명 관리 ────────────────────────────────────────────────
@@ -134,9 +147,9 @@ class MarketStore {
     // offstage였던 목록 위젯들은 마지막 빌드 상태로 멈춰 있으므로, 보이는 행과
     // 집계를 한 번 깨워 현재 상태로 맞춘다.
     for (final n in _notifiers.values) {
-      if (n.isWatched) n.bump();
+      if (n.isWatched) n.bump(); // 현재 보이는 행만 깨워 최신 상태로 다시 그린다
     }
-    _recomputeAggregates();
+    _recomputeAggregates(); // 요약·Top-20도 현재 상태로 재계산
   }
 
   /// 상세 뷰 조립(라이브 상태 + 누적 파생값 + 스파크라인 스냅샷).
@@ -179,29 +192,29 @@ class MarketStore {
   void attachForBenchmark() => start(autoStart: false);
 
   void _initFromSnapshot() {
-    symbols = _feed.symbols;
+    symbols = _feed.symbols; // 표시 순서 확정(이후 불변)
     for (final e in _feed.initialSnapshot()) {
       final c = e.info.code;
-      _infoByCode[c] = e.info;
-      _prevClose[c] = e.previousClose;
-      _shares[c] = e.info.listedShares;
-      _price[c] = e.price;
-      _volume[c] = e.dayVolume;
-      _lastTs[c] = -1;
-      _halted[c] = false;
+      _infoByCode[c] = e.info; // 정적 메타 등록
+      _prevClose[c] = e.previousClose; // 등락률·등락액의 기준선
+      _shares[c] = e.info.listedShares; // 시총 계산용 주식수
+      _price[c] = e.price; // 초기 현재가 = 스냅샷 가격
+      _volume[c] = e.dayVolume; // 초기 누적 거래량
+      _lastTs[c] = -1; // 아직 tick 없음 → 어떤 timestamp든 통과하도록 -1
+      _halted[c] = false; // 시작은 정상 거래
       _open[c] = e.price; // 구독 시점가를 시가로 삼는다
-      _high[c] = e.price;
+      _high[c] = e.price; // 고가/저가 시작점 = 현재가
       _low[c] = e.price;
 
       _chosungByCode[c] = chosungOf(e.info.name); // 이름 불변 → 1회만
 
-      final pct = _pctOf(c);
-      _treePct[c] = pct;
-      _notifiers[c] = _RowSignal();
-      _totalMarketCap += e.price * e.info.listedShares;
+      final pct = _pctOf(c); // 초기 등락률
+      _treePct[c] = pct; // 트리에 반영해 둘 pct 스냅샷
+      _notifiers[c] = _RowSignal(); // 행별 rebuild 신호 준비
+      _totalMarketCap += e.price * e.info.listedShares; // 증분 시총 초기 누적
     }
-    _ranked.addAll(symbols.map((s) => s.code));
-    _recomputeAggregates();
+    _ranked.addAll(symbols.map((s) => s.code)); // 전 종목을 랭킹 트리에 투입(초기 정렬)
+    _recomputeAggregates(); // 첫 요약·Top-20 산출
   }
 
   /// 검색어 적용. 필터 집합을 새로 만들고 집계를 갱신한다.
@@ -254,9 +267,13 @@ class MarketStore {
 
       // (1) 가격/상태: timestampMs 가드. 도착 순서가 아니라 관측 시각이 진실.
       final lastTs = _lastTs[c] ?? -1;
+
+      // 마지막 관측 timestamps보다 이후에 온 최신 데이터라면
       if (t.timestampMs > lastTs) {
+        // timestamp를 현재로 갱신
         _lastTs[c] = t.timestampMs;
         final old = _price[c]!;
+        // 가격이 변했다면
         if (t.price != old) {
           // (6) 증분 시총: 전체 순회 없이 델타만 더한다.
           _totalMarketCap += (t.price - old) * _shares[c]!;
@@ -265,7 +282,7 @@ class MarketStore {
           if (t.price < _low[c]!) _low[c] = t.price; // 저가 누적
         }
         _halted[c] = t.status == QuoteStatus.halted;
-        _dirty.add(c);
+        _dirty.add(c); // 값이 변한 종목으로 추가
 
         // 상세로 보고 있는 종목이면 스파크라인 링버퍼에 체결가 추가.
         if (c == _focusedCode) {
@@ -288,10 +305,12 @@ class MarketStore {
 
   /// (4) Coalescing: 프레임당 1회만 flush 예약. 이미 예약돼 있으면 무시.
   void _scheduleFlush() {
-    if (_flushScheduled) return;
+    if (_flushScheduled) return; // 이번 프레임에 이미 예약됨 → 중복 예약 방지
     _flushScheduled = true;
-    SchedulerBinding.instance.addPostFrameCallback((_) => _flush());
-    SchedulerBinding.instance.scheduleFrame();
+    SchedulerBinding.instance.addPostFrameCallback(
+      (_) => _flush(),
+    ); // 이번 프레임이 끝난 뒤 1회만 flush
+    SchedulerBinding.instance.scheduleFrame(); // 유휴 상태여도 프레임을 깨워 flush 보장
   }
 
   void _flush() {
@@ -300,7 +319,7 @@ class MarketStore {
 
     var topDirty = false;
     for (final c in _dirty) {
-      final pct = _pctOf(c);
+      final pct = _pctOf(c); // 등락률 계산
 
       // (5) 바뀐 종목의 행만 rebuild 신호를 준다.
       //  + 꼬리 최적화: 화면에 보이는(리스너가 붙은) 행만 신호한다. 안 보이는 행은
@@ -337,8 +356,10 @@ class MarketStore {
     final filtered = _filtered;
     if (filtered == null) {
       // 빠른 경로: 전체 시총은 증분값, Top-20은 pct 변동 시에만 트리에서 재계산.
-      summary.value =
-          MarketSummary(count: symbols.length, totalMarketCap: _totalMarketCap);
+      summary.value = MarketSummary(
+        count: symbols.length,
+        totalMarketCap: _totalMarketCap,
+      );
       if (topDirty) topMovers.value = _computeTop20Full();
     } else {
       // 필터 경로: 통과 집합만 순회(크기에 비례, bounded). 시총 합계·Top-20 산출.
@@ -346,16 +367,18 @@ class MarketStore {
       for (final c in filtered) {
         cap += _price[c]! * _shares[c]!;
       }
-      summary.value =
-          MarketSummary(count: filtered.length, totalMarketCap: cap);
+      summary.value = MarketSummary(
+        count: filtered.length,
+        totalMarketCap: cap,
+      );
       topMovers.value = _computeTop20Filtered(filtered);
     }
   }
 
   double _pctOf(String code) {
-    final base = _prevClose[code]!;
-    if (base == 0) return 0;
-    return (_price[code]! - base) / base * 100;
+    final base = _prevClose[code]!; // 기준 = 전일 종가
+    if (base == 0) return 0; // 0 나눗셈 가드(기준가 없으면 변동 0 취급)
+    return (_price[code]! - base) / base * 100; // (현재가 - 기준) / 기준 → %
   }
 
   int _compareByPctDesc(String a, String b) {
@@ -370,37 +393,45 @@ class MarketStore {
   List<TopMover> _computeTop20Full() {
     final out = <TopMover>[];
     for (final c in _ranked) {
+      // 트리가 이미 등락률 내림차순 → 앞에서부터 훑는다
       final info = _infoByCode[c]!;
-      out.add(TopMover(
-        code: c,
-        name: info.name,
-        changePct: _treePct[c]!,
-        price: _price[c]!,
-        halted: _halted[c]!,
-      ));
-      if (out.length >= 20) break;
+      out.add(
+        TopMover(
+          code: c,
+          name: info.name,
+          changePct: _treePct[c]!,
+          // 트리 정렬에 쓰인 pct 그대로(불변식 일치)
+          price: _price[c]!,
+          halted: _halted[c]!,
+        ),
+      );
+      if (out.length >= 20) break; // 20개 채우면 조기 종료(전체 순회 X)
     }
     return out;
   }
 
   /// 필터 집합 기준 Top-20: 통과 집합을 등락률 내림차순 정렬해 상위 20(집합 크기에 비례).
   List<TopMover> _computeTop20Filtered(List<String> codes) {
-    final sorted = [...codes]..sort((a, b) {
-        final c = _pctOf(b).compareTo(_pctOf(a));
-        return c != 0 ? c : a.compareTo(b);
+    final sorted = [...codes]
+      ..sort((a, b) {
+        // 통과 집합만 복사해 정렬(원본 순서 보존)
+        final c = _pctOf(b).compareTo(_pctOf(a)); // 등락률 내림차순
+        return c != 0 ? c : a.compareTo(b); // 동률은 코드로 안정 정렬
       });
-    final n = sorted.length < 20 ? sorted.length : 20;
+    final n = sorted.length < 20 ? sorted.length : 20; // 20개 미만이면 있는 만큼만
     final out = <TopMover>[];
     for (var i = 0; i < n; i++) {
       final code = sorted[i];
       final info = _infoByCode[code]!;
-      out.add(TopMover(
-        code: code,
-        name: info.name,
-        changePct: _pctOf(code),
-        price: _price[code]!,
-        halted: _halted[code]!,
-      ));
+      out.add(
+        TopMover(
+          code: code,
+          name: info.name,
+          changePct: _pctOf(code),
+          price: _price[code]!,
+          halted: _halted[code]!,
+        ),
+      );
     }
     return out;
   }
@@ -414,12 +445,12 @@ class MarketStore {
   SymbolView debugViewOf(String code) => viewOf(code);
 
   void dispose() {
-    _sub?.cancel();
+    _sub?.cancel(); // feed 구독 해제(더 이상 batch 안 받음)
     if (ownsFeed) _feed.dispose(); // 주입된 feed는 소유자가 정리
     for (final n in _notifiers.values) {
-      n.dispose();
+      n.dispose(); // 행별 notifier 전부 정리(리스너 누수 방지)
     }
-    summary.dispose();
+    summary.dispose(); // 집계 notifier들도 정리
     topMovers.dispose();
     error.dispose();
     filterVersion.dispose();
