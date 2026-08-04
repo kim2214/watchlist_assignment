@@ -36,8 +36,11 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
   @override
   void initState() {
     super.initState();
-    _store = MarketStore(widget.feed ?? MarketFeed(), ownsFeed: widget.feed == null)
-      ..start(autoStart: widget.autoStart);
+    // feed 시작, 데이터 유입 시작점
+    _store = MarketStore(
+      widget.feed ?? MarketFeed(),
+      ownsFeed: widget.feed == null,
+    )..start(autoStart: widget.autoStart);
   }
 
   @override
@@ -49,9 +52,13 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
   }
 
   // keystroke마다 필터를 돌리지 않고, 입력이 멎으면 200ms 후 1회만 적용.
+  // 검색 키 입력용 debouncer
   void _onQueryChanged(String q) {
     _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 200), () => _store.setQuery(q));
+    _debounce = Timer(
+      const Duration(milliseconds: 200),
+      () => _store.setQuery(q),
+    );
   }
 
   @override
@@ -64,12 +71,18 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
       body: Column(
         children: [
           _SearchField(controller: _searchCtrl, onChanged: _onQueryChanged),
+          // 검색 영역
           _ErrorBanner(store: _store),
           _SummaryBar(store: _store),
+          // 시황 종목 수 시가총액 표시 영역
           _TopMoversStrip(store: _store),
+          // 시총 순위 영역
           const Divider(height: 1),
           // 필터 "구조"(목록 길이/구성)가 바뀔 때만 리스트를 다시 빌드.
           Expanded(
+            // ValueListenable 과 콘텐츠가 동기화된 상태를 유지하는 위젯입니다
+            // ValueListenable<T> 와 해당 값의 구체적인 값으로부터 위젯을 생성하는 빌더가 주어지면
+            // 이 클래스는 자동으로 ValueListenableT 의 리스너로 자신을 등록하고 값이 변경될 때 업데이트된 값으로 빌더를 호출합니다.
             child: ValueListenableBuilder<int>(
               valueListenable: _store.filterVersion,
               builder: (_, _, _) {
@@ -82,6 +95,7 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
                   itemExtent: 60, // 고정 높이 → 레이아웃 계산 절감
                   itemBuilder: (context, index) {
                     final code = _store.codeAt(index);
+                    // RepaintBoundary로 전체 UI갱신이 아닌 표시되어지는 부분만 UI 갱신
                     return RepaintBoundary(
                       // int 신호가 바뀔 때만 rebuild. 데이터는 그 시점에 viewOf()로
                       // 라이브 상태에서 읽으므로 스크롤로 새로 보이는 행도 항상 최신.
@@ -139,6 +153,7 @@ class _SearchField extends StatelessWidget {
 /// 스트림 에러 배너. 에러 중에만 표시되고 다음 배치에서 자동 사라진다.
 class _ErrorBanner extends StatelessWidget {
   const _ErrorBanner({required this.store});
+
   final MarketStore store;
 
   @override
@@ -167,6 +182,7 @@ class _ErrorBanner extends StatelessWidget {
 /// 요약 영역 (표시 종목 수 + 시총 합계). summary notifier만 구독.
 class _SummaryBar extends StatelessWidget {
   const _SummaryBar({required this.store});
+
   final MarketStore store;
 
   @override
@@ -193,6 +209,7 @@ class _SummaryBar extends StatelessWidget {
 /// 등락률 상위 20 (가로 스크롤). topMovers notifier만 구독.
 class _TopMoversStrip extends StatelessWidget {
   const _TopMoversStrip({required this.store});
+
   final MarketStore store;
 
   @override
@@ -214,10 +231,10 @@ class _TopMoversStrip extends StatelessWidget {
             final color = m.halted
                 ? Colors.grey
                 : up
-                    ? Colors.red
-                    : down
-                        ? Colors.blue
-                        : Colors.grey;
+                ? Colors.red
+                : down
+                ? Colors.blue
+                : Colors.grey;
             return Container(
               width: 96,
               margin: const EdgeInsets.symmetric(horizontal: 4),
@@ -230,8 +247,11 @@ class _TopMoversStrip extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Text('${i + 1}. ${m.name}',
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                  Text(
+                    '${i + 1}. ${m.name}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
                   Text(
                     '${m.changePct >= 0 ? '+' : ''}${m.changePct.toStringAsFixed(2)}%',
                     style: TextStyle(color: color, fontWeight: FontWeight.bold),
@@ -265,10 +285,10 @@ class _WatchRow extends StatelessWidget {
     final color = view.halted
         ? Colors.grey
         : view.changePct > 0
-            ? Colors.red
-            : view.changePct < 0
-                ? Colors.blue
-                : Colors.grey;
+        ? Colors.red
+        : view.changePct < 0
+        ? Colors.blue
+        : Colors.grey;
 
     return ListTile(
       dense: true,
@@ -294,8 +314,10 @@ class _WatchRow extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          Text('${view.price.toStringAsFixed(0)}원',
-              style: const TextStyle(fontWeight: FontWeight.bold)),
+          Text(
+            '${view.price.toStringAsFixed(0)}원',
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
           Text(
             '${view.changePct >= 0 ? '+' : ''}${view.changePct.toStringAsFixed(2)}%',
             style: TextStyle(color: color, fontSize: 12),
