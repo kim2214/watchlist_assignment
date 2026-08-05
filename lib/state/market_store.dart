@@ -30,6 +30,17 @@ class MarketStore {
   /// 벤치마크처럼 외부에서 feed를 주입/정리하는 경우 false.
   final bool ownsFeed;
 
+  /// feed 구독 핸들. 데이터가 아니라 "연결"을 들고 있는 값이다.
+  ///
+  /// - `List<QuoteTick>`: 피드는 tick 하나씩이 아니라 배치 단위로 방출한다.
+  /// - `?`: start() 전에는 구독이 없다(생성자에서 만들 수 없어 nullable).
+  /// - listen()의 반환값을 버리면 다시는 끊을 수 없다. 그러면 스트림이 store를
+  ///   계속 붙잡아 GC되지 않고, dispose된 notifier를 두드려 크래시한다.
+  ///   → 반드시 dispose()의 `_sub?.cancel()`과 짝을 이룬다.
+  ///
+  /// 상세 화면의 목록 pause(_listPaused)와는 다른 층이다. 그쪽은 구독을 건드리지
+  /// 않고 알림만 멈추므로 tick은 계속 받아 상태가 최신으로 유지된다.
+  /// 여기서 pause()를 썼다면 tick 자체를 놓쳐 복귀 시 데이터에 구멍이 생긴다.
   StreamSubscription<List<QuoteTick>>? _sub;
 
   // 정적 메타 + 기준값
@@ -182,6 +193,8 @@ class MarketStore {
     _sub = _feed.ticks.listen(
       _onBatch,
       onError: _onError,
+      // 기본값 true면 에러 한 번에 구독이 자동 취소되어 피드가 영영 끊긴다.
+      // 이 앱은 일시적 지연을 배너로 알리고 회복해야 하므로 구독을 유지한다.
       cancelOnError: false, // 에러가 나도 구독을 유지한다
     );
     if (autoStart) _feed.start();
@@ -445,6 +458,9 @@ class MarketStore {
   SymbolView debugViewOf(String code) => viewOf(code);
 
   void dispose() {
+    // `?.`인 이유: start() 없이 dispose될 수 있다(구독 전 화면 이탈).
+    // 아래 notifier들을 dispose하기 전에 먼저 끊어야 _onBatch가 죽은 notifier를
+    // 건드리지 않는다(순서가 중요).
     _sub?.cancel(); // feed 구독 해제(더 이상 batch 안 받음)
     if (ownsFeed) _feed.dispose(); // 주입된 feed는 소유자가 정리
     for (final n in _notifiers.values) {

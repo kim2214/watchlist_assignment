@@ -23,11 +23,16 @@ class _DetailScreenState extends State<DetailScreen> {
   @override
   void initState() {
     super.initState();
+    // 화면 수명과 구독 수명을 일치시키는 지점.
+    // 상세가 떠 있는 동안 목록은 어차피 보이지 않으므로(offstage) 갱신을 멈추고,
+    // 이 종목의 체결가만 링버퍼에 쌓기 시작한다. → 상세 중 목록 rebuild 0회.
     widget.store.openDetail(widget.code); // 목록 pause + 스파크라인 시작
   }
 
   @override
   void dispose() {
+    // pop 시 반드시 짝을 맞춰 해제. 안 하면 목록이 멈춘 채로 돌아가고
+    // 스파크라인 버퍼도 계속 쌓인다(누수).
     widget.store.closeDetail(); // 목록 재개 + 새로고침
     super.dispose();
   }
@@ -36,13 +41,17 @@ class _DetailScreenState extends State<DetailScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        // 종목명은 tick으로 변하지 않으므로 리스너 밖(=AppBar)에서 한 번만 읽는다.
         title: Text(widget.store.detailOf(widget.code).name),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
       // 포커스 종목 신호가 바뀔 때만 rebuild(coalesced). 데이터는 그때 detailOf로 읽음.
+      // 목록과 동일한 패턴: notifier는 "바뀌었다"는 신호(int)만 나르고,
+      // 실제 값은 빌드 시점에 store에서 당겨오므로 항상 최신 상태가 그려진다.
       body: ValueListenableBuilder<int>(
         valueListenable: widget.store.notifierFor(widget.code),
         builder: (_, _, _) {
+          // rebuild 범위를 body로 한정 → Scaffold/AppBar는 다시 만들지 않는다.
           final d = widget.store.detailOf(widget.code);
           return _DetailBody(d: d);
         },
@@ -51,12 +60,16 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 }
 
+/// 상세 본문. 매 프레임 새로 만들어지므로 상태를 갖지 않고,
+/// 전달받은 [DetailView] 스냅샷만으로 그린다(그리는 쪽과 store 상태를 분리).
 class _DetailBody extends StatelessWidget {
   const _DetailBody({required this.d});
   final DetailView d;
 
   @override
   Widget build(BuildContext context) {
+    // 색 기준: 거래정지(회색) > 상승(빨강) > 하락(파랑) > 보합(회색).
+    // 정지 판정을 먼저 두어 "정지인데 빨간색" 같은 모순을 막는다.
     final up = d.changePct > 0;
     final down = d.changePct < 0;
     final color = d.halted
@@ -75,6 +88,7 @@ class _DetailBody extends StatelessWidget {
         Row(
           children: [
             Text(d.code, style: TextStyle(color: Colors.grey.shade600)),
+            // 거래정지일 때만 배지 삽입(...스프레드 → 평상시엔 위젯 자체가 없음).
             if (d.halted) ...[
               const SizedBox(width: 8),
               Container(
@@ -99,7 +113,8 @@ class _DetailBody extends StatelessWidget {
         ),
         const SizedBox(height: 20),
 
-        // 스파크라인
+        // 스파크라인: 상세 진입 이후 쌓인 최근 체결가(최대 60개 링버퍼)를 선으로.
+        // 점이 1개뿐이면 선을 그릴 수 없으므로 수집 중 문구로 대체한다.
         Container(
           height: 120,
           decoration: BoxDecoration(
@@ -116,7 +131,8 @@ class _DetailBody extends StatelessWidget {
         ),
         const SizedBox(height: 20),
 
-        // 시/고/저 + 거래량
+        // 시/고/저 + 거래량. tick마다 UI에서 계산하지 않고 store가 스트림에서
+        // 누적해 둔 값을 그대로 읽는다(= 화면은 표시만 담당).
         _row('시가', '${_fmt(d.open)}원'),
         _row('고가', '${_fmt(d.high)}원'),
         _row('저가', '${_fmt(d.low)}원'),
@@ -160,17 +176,22 @@ class _SparklinePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // 창(window) 안의 min/max로 매번 y축을 다시 정규화한다.
+    // 절대 가격이 아니라 "이 구간의 상대 움직임"을 보여주는 것이 목적.
     double min = prices.first, max = prices.first;
     for (final p in prices) {
       if (p < min) min = p;
       if (p > max) max = p;
     }
+    // 모든 값이 같으면(평탄) range=0 → 0으로 나눠 NaN이 되므로 1.0으로 대체.
     final range = (max - min).abs() < 1e-9 ? 1.0 : (max - min);
+    // 점 n개를 폭에 균등 배치. paint는 length>=2일 때만 호출되므로 0 나눗셈 없음.
     final dx = size.width / (prices.length - 1);
 
     final path = Path();
     for (var i = 0; i < prices.length; i++) {
       final x = dx * i;
+      // 캔버스 y는 아래로 증가 → height에서 빼서 위아래를 뒤집는다(고가가 위).
       final y = size.height - ((prices[i] - min) / range) * size.height;
       if (i == 0) {
         path.moveTo(x, y);
@@ -179,6 +200,7 @@ class _SparklinePainter extends CustomPainter {
       }
     }
 
+    // 채우기 없이 선만(stroke) — Path를 한 번에 그려 draw 콜을 1회로 유지.
     final paint = Paint()
       ..color = color
       ..strokeWidth = 1.5
