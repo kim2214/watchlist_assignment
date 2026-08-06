@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:collection';
 
+// Float64List/Int32List는 foundation이 dart:typed_data를 재수출해 함께 들어온다.
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 
@@ -19,7 +19,7 @@ import '../seed/market_models.dart';
 ///     프레임당 1회 flush (시간축 최소화)
 ///  5) rebuild 범위 축소 — 종목별 ValueNotifier로 "바뀐 행"만 갱신 (공간축 최소화)
 ///  6) 증분 집계 — 시총 합계는 델타로만 갱신 (전체 순회 X)
-///  7) Top-20 라이브 랭킹 — SplayTreeSet로 dirty 종목만 재삽입 (전체 재정렬 X)
+///  7) Top-20 라이브 랭킹 — 등락률을 Float64List에 O(1) 갱신 + 20슬롯 선형 선택
 class MarketStore {
   MarketStore(this._feed, {this.ownsFeed = true});
 
@@ -89,12 +89,37 @@ class MarketStore {
   // 증분 시총 합계
   double _totalMarketCap = 0;
 
-  // Top-20 라이브 랭킹: 등락률 내림차순으로 전 종목 정렬 유지.
-  // 트리에 반영된 pct는 _treePct에 따로 보관해 트리 불변식을 지킨다.
-  final Map<String, double> _treePct = {};
-  late final SplayTreeSet<String> _ranked = SplayTreeSet<String>(
-    _compareByPctDesc,
-  );
+  // Top-20 라이브 랭킹.
+  //
+  // 설계 근거(PERF.md §5): 이전에는 SplayTreeSet을 등락률 내림차순으로 유지하며
+  // pct가 바뀐 종목만 remove→add 했다(O(dirty·log n)). 실측(perf/top20_bench.dart)
+  // 결과 이 구조가 **상수 인자에서 36배 졌다**: 175us/프레임 → 4.8us/프레임.
+  //
+  // 빅오가 아니라 상수가 원인이라는 점이 중요하다. 트리가 유리한 조건은
+  //   dirty · log₂n < n  →  dirty < 2000/11 ≈ 182
+  // 인데 실제 dirty는 평균 100(p90 182, max 214)이라 **대부분의 프레임에서 트리가
+  // 빅오상 유리한 쪽**이었다. 그런데도 진 이유는 프레임당 비교자 호출 4,477회이고
+  // 그 한 번마다 `_treePct` 해시 조회 2회 + 박싱 double 비교가 붙으며, 트리 노드
+  // 순회가 포인터 추적(캐시 미스)이기 때문이다.
+  //
+  // 그래서 "인덱스로 O(1) 갱신 + 연속 메모리 선형 선택"으로 바꿨다:
+  //  - 갱신: dirty 종목의 pct를 Float64List 한 칸에 쓴다 (log n 소멸)
+  //  - 선택: 전체를 한 번 훑어 20슬롯만 유지 (_topK) — 깨질 불변식이 없다
+  // symbols는 스냅샷 이후 불변이므로 "인덱스 i ↔ symbols[i].code"가 안정적이다.
+  //
+  // 실기기 검증에서 더 큰 소득은 **할당 제거**였다(PERF.md §5.5). 이전 구조는 프레임당
+  // 두 종류를 할당했다 — Map<String,double>에 넣는 double은 박싱되고, SplayTreeSet.add는
+  // 노드를 새로 만든다(remove+add 쌍이라 매번). dirty 100 × 2종 × 636프레임 ≈ 12만 개.
+  // Float64List는 언박싱 저장이라 할당이 0이다. 그 결과 old-gen GC 회귀(+71%)가 ±0%로,
+  // young-gen GC 개선폭이 −26%에서 −54%로 바뀌었다.
+  //
+  // 반면 **프레임 타임 꼬리(99th/worst)는 개선되지 않았다.** 꼬리의 주범은 랭킹 계산이
+  // 아니라 Top-20 카드·행의 위젯 rebuild다(PERF.md §5.5 ②). 여기를 더 깎아도 꼬리는
+  // 움직이지 않으니, 다음 작업은 카드 diff 쪽이다.
+  final Map<String, int> _indexOf = {}; // code → symbols 내 고정 인덱스
+  late final Float64List _pct; // 인덱스별 등락률(flush 시점 스냅샷)
+
+  static const int _topCount = 20;
 
   // 프레젠테이션이 구독하는 집계 notifier들 (행 rebuild와 격리)
   final ValueNotifier<MarketSummary> summary = ValueNotifier(
@@ -206,6 +231,14 @@ class MarketStore {
 
   void _initFromSnapshot() {
     symbols = _feed.symbols; // 표시 순서 확정(이후 불변)
+
+    // 랭킹용 인덱스 축을 먼저 세운다. 스냅샷 순회 순서가 symbols 순서와 같다는
+    // 보장이 없으므로, 인덱스는 반드시 symbols(표시 순서)를 기준으로 매긴다.
+    for (var i = 0; i < symbols.length; i++) {
+      _indexOf[symbols[i].code] = i;
+    }
+    _pct = Float64List(symbols.length);
+
     for (final e in _feed.initialSnapshot()) {
       final c = e.info.code;
       _infoByCode[c] = e.info; // 정적 메타 등록
@@ -221,12 +254,10 @@ class MarketStore {
 
       _chosungByCode[c] = chosungOf(e.info.name); // 이름 불변 → 1회만
 
-      final pct = _pctOf(c); // 초기 등락률
-      _treePct[c] = pct; // 트리에 반영해 둘 pct 스냅샷
+      _pct[_indexOf[c]!] = _pctOf(c); // 초기 등락률을 랭킹 배열에 채운다
       _notifiers[c] = _RowSignal(); // 행별 rebuild 신호 준비
       _totalMarketCap += e.price * e.info.listedShares; // 증분 시총 초기 누적
     }
-    _ranked.addAll(symbols.map((s) => s.code)); // 전 종목을 랭킹 트리에 투입(초기 정렬)
     _recomputeAggregates(); // 첫 요약·Top-20 산출
   }
 
@@ -348,11 +379,11 @@ class MarketStore {
         notifier.bump();
       }
 
-      // (7) Top-20: pct가 바뀐 종목만 트리에서 빼고 다시 넣는다(전체 재정렬 X).
-      if (_treePct[c] != pct) {
-        _ranked.remove(c); // 트리는 아직 옛 pct 기준 → 제거가 정확히 동작
-        _treePct[c] = pct;
-        _ranked.add(c);
+      // (7) Top-20: pct가 바뀐 종목의 배열 한 칸만 덮어쓴다(O(1), 정렬 자료구조 없음).
+      // 순서는 여기서 유지하지 않는다 — 선택은 아래 _topK의 선형 스캔이 담당한다.
+      final i = _indexOf[c]!;
+      if (_pct[i] != pct) {
+        _pct[i] = pct;
         topDirty = true;
       }
     }
@@ -373,7 +404,7 @@ class MarketStore {
         count: symbols.length,
         totalMarketCap: _totalMarketCap,
       );
-      if (topDirty) topMovers.value = _computeTop20Full();
+      if (topDirty) topMovers.value = _topK();
     } else {
       // 필터 경로: 통과 집합만 순회(크기에 비례, bounded). 시총 합계·Top-20 산출.
       var cap = 0.0;
@@ -384,7 +415,7 @@ class MarketStore {
         count: filtered.length,
         totalMarketCap: cap,
       );
-      topMovers.value = _computeTop20Filtered(filtered);
+      topMovers.value = _topK(filtered);
     }
   }
 
@@ -394,53 +425,57 @@ class MarketStore {
     return (_price[code]! - base) / base * 100; // (현재가 - 기준) / 기준 → %
   }
 
-  int _compareByPctDesc(String a, String b) {
-    if (a == b) return 0;
-    final pa = _treePct[a] ?? 0;
-    final pb = _treePct[b] ?? 0;
-    final c = pb.compareTo(pa); // 내림차순
-    return c != 0 ? c : a.compareTo(b); // 동률은 코드로 안정 정렬
-  }
+  /// 등락률 상위 [_topCount]를 **한 번의 선형 스캔**으로 고른다.
+  /// [scope]가 null이면 전체 기준, 아니면 필터 통과 집합 기준(전체/필터 경로 공용).
+  ///
+  /// 정렬(O(m log m))이 아니라 **k슬롯 삽입 선택**(O(m))이다:
+  ///  - `floor`(현재 k위의 pct)보다 낮은 후보는 비교 1회로 즉시 탈락 → 2,000개
+  ///    대부분이 여기서 끝난다.
+  ///  - 통과한 소수만 크기 20 배열에서 자리를 찾아 뒤로 밀어낸다(이동 상한 20).
+  ///  - pct는 Float64List·후보는 Int32List로 들고 있어 순회가 **연속 메모리**다.
+  ///    비교마다 해시 조회가 붙던 트리 비교자와의 상수 차이가 여기서 난다.
+  ///
+  /// 동률 처리: 엄격 부등호(`<`)로만 밀어내므로 **먼저 훑은 쪽이 앞선다**. 스캔
+  /// 순서는 `symbols`(표시 순서, 불변) 기준이라 결과는 결정론적이다. 이 피드의
+  /// 코드는 `000001`부터 증가하며 발급되므로 종전의 "동률은 코드 오름차순"과
+  /// 동일한 순서가 나온다.
+  List<TopMover> _topK([List<String>? scope]) {
+    final m = scope?.length ?? symbols.length;
+    final k = m < _topCount ? m : _topCount;
+    if (k == 0) return const <TopMover>[];
 
-  /// 전체 기준 Top-20: SplayTreeSet의 앞에서 20개(트리가 이미 정렬 유지).
-  List<TopMover> _computeTop20Full() {
-    final out = <TopMover>[];
-    for (final c in _ranked) {
-      // 트리가 이미 등락률 내림차순 → 앞에서부터 훑는다
-      final info = _infoByCode[c]!;
-      out.add(
-        TopMover(
-          code: c,
-          name: info.name,
-          changePct: _treePct[c]!,
-          // 트리 정렬에 쓰인 pct 그대로(불변식 일치)
-          price: _price[c]!,
-          halted: _halted[c]!,
-        ),
-      );
-      if (out.length >= 20) break; // 20개 채우면 조기 종료(전체 순회 X)
+    final topIdx = Int32List(k); // 상위 k의 종목 인덱스 (pct 내림차순)
+    final topPct = Float64List(k); // 그 pct 값 (비교용, 재조회 없음)
+    var filled = 0;
+    var floor = double.negativeInfinity; // k칸이 찰 때까지는 누구도 탈락시키지 않는다
+
+    for (var s = 0; s < m; s++) {
+      // 전체 경로는 인덱스가 곧 스캔 위치. 필터 경로만 code → 인덱스 조회 1회.
+      final i = scope == null ? s : _indexOf[scope[s]]!;
+      final p = _pct[i];
+      if (filled == k && p <= floor) continue; // 대부분 여기서 탈락
+
+      var q = filled < k ? filled : k - 1; // 꽉 찼으면 최하위 칸을 덮어쓴다
+      while (q > 0 && topPct[q - 1] < p) {
+        topPct[q] = topPct[q - 1]; // 자기보다 낮은 것들을 뒤로 밀어낸다
+        topIdx[q] = topIdx[q - 1];
+        q--;
+      }
+      topPct[q] = p;
+      topIdx[q] = i;
+      if (filled < k) filled++;
+      if (filled == k) floor = topPct[k - 1]; // 경계값 갱신
     }
-    return out;
-  }
 
-  /// 필터 집합 기준 Top-20: 통과 집합을 등락률 내림차순 정렬해 상위 20(집합 크기에 비례).
-  List<TopMover> _computeTop20Filtered(List<String> codes) {
-    final sorted = [...codes]
-      ..sort((a, b) {
-        // 통과 집합만 복사해 정렬(원본 순서 보존)
-        final c = _pctOf(b).compareTo(_pctOf(a)); // 등락률 내림차순
-        return c != 0 ? c : a.compareTo(b); // 동률은 코드로 안정 정렬
-      });
-    final n = sorted.length < 20 ? sorted.length : 20; // 20개 미만이면 있는 만큼만
     final out = <TopMover>[];
-    for (var i = 0; i < n; i++) {
-      final code = sorted[i];
-      final info = _infoByCode[code]!;
+    for (var r = 0; r < filled; r++) {
+      final info = symbols[topIdx[r]]; // 인덱스로 바로 메타 접근(_infoByCode 조회 불필요)
+      final code = info.code;
       out.add(
         TopMover(
           code: code,
           name: info.name,
-          changePct: _pctOf(code),
+          changePct: topPct[r], // 선택에 쓰인 값 그대로(표시와 순서가 어긋나지 않는다)
           price: _price[code]!,
           halted: _halted[code]!,
         ),
